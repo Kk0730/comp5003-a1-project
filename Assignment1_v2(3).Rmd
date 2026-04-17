@@ -1,0 +1,546 @@
+---
+title: "STAT5003 Assignment -w7"
+author: "Jeannie Chang, ..."
+output:
+  html_document:
+    code_folding: hide 
+---
+
+## 0. Introduction
+
+Australia’s population is constantly changing, but these changes are not the same in every region. Some areas grow as people move in for jobs and housing, while others lose residents to larger cities. At the same time, some regions are ageing, while others are growing younger because of new families and different settlement patterns.
+
+For infrastructure planners, combining these two dimensions can lead to very different planning strategies:
+
+| Mobility \ Ageing | Ageing | Stable | Growing Younger |
+|---|---|---|---|
+| **Moving Out** | **Revitalise**: Prevent "brain drain" and local decline. | **Investigate**: Why are people leaving a stable area? | **Supply**: Ensure enough housing for young people. |
+| **Stable** | **Support**: Focus on aged care and local health. | **Maintain**: Monitor services; no major shift. | **Prepare**: Plan for schools and childcare. |
+| **Moving In** | **Balance**: Attract young families for social health. | **Manage**: Ensure infrastructure keeps up with growth. | **Build**: High investment in family infrastructure. |
+
+This project uses Australian Bureau of Statistics (ABS) data to classify SA2 regions. We aim to identify which socio-economic features best predict demographic shift, providing a more policy-relevant view of local change.
+
+## 1. Framing & Dataset Selection
+
+### 1-1 Research Question
+
+How accurately can we predict a region's demographic shift, specifically ageing and migration, helping planners decide the infrastructure and policy strategy?
+
+### 1-2 Project Methodology
+
+We use a two-step approach to solve the classification task:
+- *Label Creation (Calculated)*: We calculate both year-over-year percentage change in estimated resident population and year-over-year change in median age using ABS longitudinal data. We then assign each region-year observation to a mobility label (**Moving Out**, **Stable**, **Moving In**) and an ageing label (**Ageing**, **Age-Stable**, **Growing Younger**), then combine them into a 9-class profile.
+- *Classification (Predictive)*: We build supervised models to predict these combined labels using current income and population characteristics.
+
+## 2. Consider & Gather Data
+
+### 2-1 Data Sources
+
+We use two spreadsheets from the ABS *Data by Region, 2011–2025* release (https://www.abs.gov.au/methodologies/data-region-methodology/2011-24#data-downloads):
+
+- **`14100DO0001_2011-25.xlsx`** — regional population and demographic variables (age structure, sex composition, population density, working-age population, etc.)
+- **`14100DO0004_2011-25.xlsx`** — regional income variables (median income, income bracket distributions, etc.)
+
+The longitudinal structure is essential: we derive both mobility and ageing labels from year-over-year changes in population and median age, then use income and population features to predict the combined 9-class profile.
+
+The two datasets pass the CRAAP quality test:
+- **Currency & Relevance**: Latest ABS Data by Region 2011–2025 release; ideal for measuring regional mobility and demographic change.
+- **Authority & Accuracy**: Sourced from the Australian Bureau of Statistics (ABS), the national standard for Australian demographic data.
+- **Purpose**: Objective, public-research data designed for regional analysis and policy planning.
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(scales)
+library(knitr)
+
+# ── File paths ──────────────────────────────────────────────────────────────
+population_file <- "14100DO0001_2011-25.xlsx"
+income_file     <- "14100DO0004_2011-25.xlsx"
+
+# ── 1. Sheet names ──────────────────────────────────────────────────────────
+pop_sheets    <- excel_sheets(population_file)
+income_sheets <- excel_sheets(income_file)
+cat("Population file ->", length(pop_sheets), "sheets :", paste(pop_sheets, collapse = ", "), "\n")
+cat("Income file     ->", length(income_sheets), "sheets :", paste(income_sheets, collapse = ", "), "\n")
+
+# ── 2. Shape of every Table sheet ──────────────────────────────────────────
+pop_table_sheets    <- pop_sheets[str_detect(pop_sheets, "^Table")]
+income_table_sheets <- income_sheets[str_detect(income_sheets, "^Table")]
+
+# ── 3. Load and combine all Table sheets ───────────────────────────────────
+# not clean here because we need to calculate the dirty rate
+load_all_tables <- function(filepath, table_sheets) {
+  map_dfr(table_sheets, function(sheet) {
+    read_excel(
+      filepath,
+      sheet = sheet,
+      skip = 6,
+      na = c("-", "..", " ", "np", "n.p.", "–")
+    ) %>%
+      mutate(
+        source = sheet,
+        t2 = sheet == "Table 2",
+        t3 = sheet == "Table 3"
+      )
+  })
+}
+
+population_raw <- load_all_tables(population_file, pop_table_sheets)
+income_raw     <- load_all_tables(income_file, income_table_sheets)
+```
+
+### 2-2 Dataset Justification
+
+The dataset meets the project requirements as follows:
+
+```{r}
+# ── Create popul_df and income_df ──────────────────────────────────────────
+popul_df  <- population_raw
+income_df <- income_raw
+
+# Identify non-identifier columns
+id_cols       <- c("Code", "Label", "Year", "source", "t2", "t3")
+data_cols_pop <- setdiff(names(popul_df), id_cols)
+data_cols_inc <- setdiff(names(income_df), id_cols)
+
+# Convert data columns to numeric
+popul_df  <- popul_df %>% mutate(across(all_of(data_cols_pop), ~ suppressWarnings(as.numeric(.x))))
+income_df <- income_df %>% mutate(across(all_of(data_cols_inc), ~ suppressWarnings(as.numeric(.x))))
+
+# Outlier rate: Tukey IQR fence
+iqr_outlier_rate <- function(df, cols) {
+  vals <- as.matrix(df[, cols, drop = FALSE])
+  q1 <- apply(vals, 2, quantile, probs = 0.25, na.rm = TRUE)
+  q3 <- apply(vals, 2, quantile, probs = 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower <- q1 - 1.5 * iqr
+  upper <- q3 + 1.5 * iqr
+
+  valid <- !is.na(vals)
+  is_out <- sweep(vals, 2, lower, `<`) | sweep(vals, 2, upper, `>`)
+  is_out[!valid] <- FALSE
+
+  if (sum(valid) == 0) return(NA_real_)
+  sum(is_out) / sum(valid)
+}
+
+pop_outlier <- iqr_outlier_rate(popul_df, data_cols_pop)
+inc_outlier <- iqr_outlier_rate(income_df, data_cols_inc)
+
+# ── Summary table ───────────────────────────────────────────────────────────
+pop_miss <- mean(is.na(as.matrix(popul_df[, data_cols_pop, drop = FALSE])))
+inc_miss <- mean(is.na(as.matrix(income_df[, data_cols_inc, drop = FALSE])))
+
+summary_tbl <- tibble(
+  DataFrame = c("popul_df", "income_df"),
+  Rows = c(format(nrow(popul_df), big.mark = ","), format(nrow(income_df), big.mark = ",")),
+  `Total columns` = c(ncol(popul_df), ncol(income_df)),
+  `Data columns` = c(length(data_cols_pop), length(data_cols_inc)),
+  `Overall missing %` = c(percent(pop_miss, accuracy = 0.1), percent(inc_miss, accuracy = 0.1)),
+  `Potential outliers %` = c(percent(pop_outlier, accuracy = 0.1), percent(inc_outlier, accuracy = 0.1))
+)
+
+knitr::kable(summary_tbl)
+```
+
+more than 3 requirements are met:
+- **Large**: 31k+ population rows and 38k+ income rows across all geographic levels; SA2-level alone exceeds 10,000 observations.
+- **Messy**: ~50% overall missing value rate and ~8% potential outliers in non-missing values.
+- **Complex**: 163 population columns and 56 income columns combined (>100 threshold).
+- **Complex**: rows span multiple geographic levels (National, State, SA4, SA3, LGA, SA2), which overlap hierarchically.
+- **Integration**: data is from two source.
+
+For our mobility analysis we prefer avoiding information overlap and retaining only one geo level, So we do the screening on geo level first:
+
+```{r}
+# ── Geographic level breakdown: row count + missing rate ───────────────────
+classify_geo <- function(code, t2, t3) {
+  s <- str_trim(as.character(code))
+
+  case_when(
+    s == "AUS" ~ "National",
+    str_detect(s, "^[0-9]$") ~ "State/Territory",
+    str_detect(s, "^[0-9]{3}$") & t3 ~ "Remote",
+    str_detect(s, "^[0-9]{3}$") ~ "SA4",
+    nchar(s) == 5 & !str_detect(s, "^[0-9]+$") ~ "GCCSA",
+    str_detect(s, "^[0-9]{5}$") & t2 ~ "LGA",
+    str_detect(s, "^[0-9]{5}$") & !t2 ~ "SA3",
+    str_detect(s, "^[0-9]{9}$") ~ "SA2",
+    TRUE ~ "Other"
+  )
+}
+
+popul_df <- popul_df %>% mutate(geo_level = classify_geo(Code, t2, t3))
+income_df <- income_df %>% mutate(geo_level = classify_geo(Code, t2, t3))
+
+pop_geo_counts <- popul_df %>% count(geo_level, name = "rows")
+income_geo_counts <- income_df %>% count(geo_level, name = "rows")
+
+pop_missing <- popul_df %>%
+  group_by(geo_level) %>%
+  summarise(missing_rate = mean(is.na(as.matrix(across(all_of(data_cols_pop))))), .groups = "drop")
+
+inc_missing <- income_df %>%
+  group_by(geo_level) %>%
+  summarise(missing_rate = mean(is.na(as.matrix(across(all_of(data_cols_inc))))), .groups = "drop")
+
+geo_order <- c("National", "State/Territory", "GCCSA", "SA4", "SA3", "LGA", "SA2")
+
+row_df <- bind_rows(
+  pop_geo_counts %>% mutate(file = "Population"),
+  income_geo_counts %>% mutate(file = "Income")
+) %>%
+  mutate(geo_level = factor(geo_level, levels = geo_order))
+
+miss_df <- bind_rows(
+  pop_missing %>% mutate(file = "Population"),
+  inc_missing %>% mutate(file = "Income")
+) %>%
+  mutate(geo_level = factor(geo_level, levels = geo_order))
+
+ggplot(row_df, aes(x = geo_level, y = rows, fill = file)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Population" = "steelblue", "Income" = "coral")) +
+  labs(
+    title = "Row count by geographic level (evidence: Large criterion)",
+    x = "Geographic level",
+    y = "Number of rows"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+ggplot(miss_df, aes(x = geo_level, y = missing_rate, fill = file)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Population" = "steelblue", "Income" = "coral")) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Missing value rate by geographic level (evidence: Messy criterion)",
+    x = "Geographic level",
+    y = "Missing rate"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+SA2 is the preferred geographic level for this project: it provides sufficient granularity to capture local mobility change while having enough observations (>10,000 labelled rows after year-on-year differencing) for reliable classification. We filter both cleaned dataframes to SA2 and carry forward only these rows for all subsequent steps.
+
+```{r}
+# Filter to SA2 level using geo_level column assigned above
+population_sa2 <- popul_df %>% filter(geo_level == "SA2")
+income_sa2     <- income_df %>% filter(geo_level == "SA2")
+
+cat("population_sa2 :", format(nrow(population_sa2), big.mark = ","), "rows\n")
+cat("income_sa2     :", format(nrow(income_sa2), big.mark = ","), "rows\n")
+```
+
+## 3. Exploratory Data Analysis (EDA)
+
+### 3-1 Univariate Analysis
+
+The high overall missing rate (~40–65%) observed in Section 2 partially reflects ABS suppression of small counts: a value is withheld when it is too small to publish, not because it is truly absent. For percentage breakdown columns (age group shares, income bracket shares), a suppressed cell effectively means the proportion rounds to zero.
+
+We therefore distinguish two types of column:
+- **Key columns** — those whose name contains *"total"* — which serve as summary measures and should be populated for all valid SA2 observations.
+- **Breakdown columns** — all others — where NaN can legitimately represent zero.
+
+The approach: identify key columns, compute their missing rate, and drop rows where more than 50% of key columns are NaN. Then impute 0 into remaining NaN cells across breakdown columns.
+
+#### 3-1-1 refine column name
+
+```{r}
+# ── Non-missing rate per column ─────────────────────────────────────────────
+data_cols_sa2_pop_all <- setdiff(names(population_sa2), c("Code", "Label", "Year", "source", "t2", "t3", "geo_level"))
+data_cols_sa2_inc_all <- setdiff(names(income_sa2), c("Code", "Label", "Year", "source", "t2", "t3", "geo_level"))
+
+pop_nonmiss <- sort(colMeans(!is.na(as.matrix(population_sa2[, data_cols_sa2_pop_all, drop = FALSE]))), decreasing = TRUE)
+inc_nonmiss <- sort(colMeans(!is.na(as.matrix(income_sa2[, data_cols_sa2_inc_all, drop = FALSE]))), decreasing = TRUE)
+
+make_panel_df <- function(x, dataset_name) {
+  top10 <- tibble(
+    column = names(head(x, 10)),
+    non_missing_rate = as.numeric(head(x, 10)),
+    panel = paste(dataset_name, "— Top 10 most complete columns")
+  )
+
+  bottom10 <- tibble(
+    column = names(rev(tail(x, 10))),
+    non_missing_rate = as.numeric(rev(tail(x, 10))),
+    panel = paste(dataset_name, "— Bottom 10 least complete columns")
+  )
+
+  bind_rows(top10, bottom10)
+}
+
+nonmiss_plot_df <- bind_rows(
+  make_panel_df(pop_nonmiss, "population_sa2"),
+  make_panel_df(inc_nonmiss, "income_sa2")
+) %>%
+  mutate(column = str_trunc(column, 45))
+
+ggplot(nonmiss_plot_df, aes(x = reorder(column, non_missing_rate), y = non_missing_rate, fill = panel)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ panel, scales = "free_y", ncol = 2) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Non-Missing Value Rate by Column (SA2 level)",
+    x = NULL,
+    y = "Non-missing rate"
+  ) +
+  theme_minimal()
+```
+
+#### 3-1-2 missing row remove
+
+We select only column names containing *"total"* as key columns and compute their missing rate. Rows where more than 50% of key columns are NaN are considered too incomplete and dropped. This ensures downstream analysis is not distorted by rows that contain too little usable summary data.
+
+```{r}
+# ── Key columns: names containing 'total' ──────────────────────────────────
+id_cols_full <- c("Code", "Label", "Year", "source", "t2", "t3", "geo_level")
+
+key_cols_pop <- names(population_sa2)[str_detect(str_to_lower(names(population_sa2)), "total") & !(names(population_sa2) %in% id_cols_full)]
+key_cols_inc <- names(income_sa2)[str_detect(str_to_lower(names(income_sa2)), "total") & !(names(income_sa2) %in% id_cols_full)]
+
+cat("Key population columns (", length(key_cols_pop), "):\n", sep = "")
+cat(paste0("  ", key_cols_pop, collapse = "\n"), "\n")
+cat("\nKey income columns (", length(key_cols_inc), "):\n", sep = "")
+cat(paste0("  ", key_cols_inc, collapse = "\n"), "\n")
+
+# Missing rate on key columns only
+cat("\n── Missing rate on key columns ─────────────────────────\n")
+cat("\nPopulation:\n")
+print(percent(colMeans(is.na(as.matrix(population_sa2[, key_cols_pop, drop = FALSE]))), accuracy = 0.1))
+cat("\nIncome:\n")
+print(percent(colMeans(is.na(as.matrix(income_sa2[, key_cols_inc, drop = FALSE]))), accuracy = 0.1))
+
+# Drop rows where more than 50% of key columns are NA
+population_sa2_clean <- population_sa2 %>%
+  filter(rowMeans(is.na(across(all_of(key_cols_pop)))) <= 0.5)
+
+income_sa2_clean <- income_sa2 %>%
+  filter(rowMeans(is.na(across(all_of(key_cols_inc)))) <= 0.5)
+
+cat(
+  "\nPopulation SA2 :", format(nrow(population_sa2), big.mark = ","), "→",
+  format(nrow(population_sa2_clean), big.mark = ","), "rows  (dropped",
+  format(nrow(population_sa2) - nrow(population_sa2_clean), big.mark = ","), ")\n"
+)
+cat(
+  "Income SA2     :", format(nrow(income_sa2), big.mark = ","), "→",
+  format(nrow(income_sa2_clean), big.mark = ","), "rows  (dropped",
+  format(nrow(income_sa2) - nrow(income_sa2_clean), big.mark = ","), ")\n"
+)
+```
+
+After removing rows with too much missingness in the key columns, remaining NaN cells in breakdown columns are imputed as 0. This is defensible because ABS suppresses values that are too small to publish — for our percentage columns, this is equivalent to a share of effectively zero.
+
+```{r}
+# ── Impute NA → 0 in breakdown data columns ────────────────────────────────
+id_cols_full <- c("Code", "Label", "Year", "source", "t2", "t3", "geo_level")
+data_cols_sa2_pop <- setdiff(names(population_sa2_clean), id_cols_full)
+data_cols_sa2_inc <- setdiff(names(income_sa2_clean), id_cols_full)
+
+population_sa2_clean <- population_sa2_clean %>%
+  mutate(across(all_of(data_cols_sa2_pop), ~ replace_na(.x, 0)))
+
+income_sa2_clean <- income_sa2_clean %>%
+  mutate(across(all_of(data_cols_sa2_inc), ~ replace_na(.x, 0)))
+
+cat("Remaining NA after imputation:\n")
+cat("  population_sa2_clean :", sum(is.na(as.matrix(population_sa2_clean[, data_cols_sa2_pop, drop = FALSE]))), "\n")
+cat("  income_sa2_clean     :", sum(is.na(as.matrix(income_sa2_clean[, data_cols_sa2_inc, drop = FALSE]))), "\n")
+```
+
+#### 3-1-3 outlier detection
+
+#### 3-1-4 processing for data merging
+
+although data look across 14 years, but few year is missing data
+
+```{r}
+# ── Overall non-missing value % by year in SA2 ─────────────────────────────
+# Reuse key_cols_pop and key_cols_inc defined above.
+
+pop_year_nonmiss <- population_sa2 %>%
+  group_by(Year) %>%
+  summarise(non_missing_rate = mean(!is.na(as.matrix(across(all_of(key_cols_pop))))), .groups = "drop") %>%
+  mutate(file = "Population")
+
+inc_year_nonmiss <- income_sa2 %>%
+  group_by(Year) %>%
+  summarise(non_missing_rate = mean(!is.na(as.matrix(across(all_of(key_cols_inc))))), .groups = "drop") %>%
+  mutate(file = "Income")
+
+year_nonmiss_df <- bind_rows(pop_year_nonmiss, inc_year_nonmiss)
+
+ggplot(year_nonmiss_df, aes(x = Year, y = non_missing_rate, color = file)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ file, ncol = 2) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_color_manual(values = c("Population" = "steelblue", "Income" = "coral")) +
+  labs(
+    title = "SA2 overall completeness over time",
+    x = "Year",
+    y = "Non-missing rate"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+As a data integrity check, we verify that percentage breakdown columns sum to approximately 100 per row. Age group percentage columns (for Persons) and income bracket percentage columns should each sum to ~100. Rows that fall well outside this range indicate residual data quality issues.
+
+```{r}
+# ── Sum check: percentage columns should sum to ~100 per row ───────────────
+age_pct_cols <- names(population_sa2_clean)[
+  str_detect(names(population_sa2_clean), "Persons") &
+    str_detect(names(population_sa2_clean), "years") &
+    str_detect(names(population_sa2_clean), fixed("(%)"))
+]
+
+inc_pct_cols <- names(income_sa2_clean)[
+  str_detect(str_to_lower(names(income_sa2_clean)), "per week \\(%\\)")
+]
+
+cat("── Age group % sum check (Persons, should be ~100) ──────\n")
+if (length(age_pct_cols) > 0) {
+  s <- rowSums(population_sa2_clean[, age_pct_cols, drop = FALSE])
+  cat("  Columns :", length(age_pct_cols), "\n")
+  cat("  Mean    :", sprintf("%.2f", mean(s)), "   Min :", sprintf("%.2f", min(s)), "   Max :", sprintf("%.2f", max(s)), "\n")
+  cat("  Rows outside [95, 105] :", format(sum(s < 95 | s > 105), big.mark = ","), "\n")
+} else {
+  cat("  No matching columns found\n")
+}
+
+cat("\n── Income bracket % sum check (should be ~100) ──────────\n")
+if (length(inc_pct_cols) > 0) {
+  s2 <- rowSums(income_sa2_clean[, inc_pct_cols, drop = FALSE])
+  cat("  Columns :", length(inc_pct_cols), "\n")
+  cat("  Mean    :", sprintf("%.2f", mean(s2)), "   Min :", sprintf("%.2f", min(s2)), "   Max :", sprintf("%.2f", max(s2)), "\n")
+  cat("  Rows outside [95, 105] :", format(sum(s2 < 95 | s2 > 105), big.mark = ","), "\n")
+} else {
+  cat("  No matching columns found\n")
+}
+```
+
+### 3-2 Bivariate Analysis
+
+Since our target variable (mobility × ageing profile) does not exist in the raw data, we engineer it here. We merge the SA2 population and income datasets on region code and year, then compute both year-over-year percentage change in estimated resident population and year-over-year change in median age per SA2 region.
+
+The mobility rules are:
+
+| Mobility label | Rule |
+|---|---|
+| `moving_out` | Population change < -x% YoY |
+| `stable` | Change between -x% and x% YoY |
+| `moving_in` | Population change > x% YoY |
+
+The ageing rules are:
+
+| Ageing label | Rule |
+|---|---|
+| `ageing` | Median age increased by > x years YoY |
+| `age_stable` | Change within ±x years |
+| `growing_younger` | Median age decreased by > x years YoY |
+
+We then combine the two dimensions into a 9-class profile and examine which income and demographic characteristics differ across these joint classes.
+
+```{r}
+# ── Merge population and income at SA2 level ────────────────────────────────
+id_cols_full <- c("Code", "Label", "Year", "source", "t2", "t3", "geo_level")
+data_cols_sa2_pop <- setdiff(names(population_sa2_clean), id_cols_full)
+data_cols_sa2_inc <- setdiff(names(income_sa2_clean), id_cols_full)
+
+combined <- population_sa2_clean %>%
+  select(Code, Label, Year, all_of(data_cols_sa2_pop)) %>%
+  inner_join(
+    income_sa2_clean %>% select(Code, Year, all_of(data_cols_sa2_inc)),
+    by = c("Code", "Year")
+  )
+
+cat("Combined dataset:", format(nrow(combined), big.mark = ","), "rows x", ncol(combined), "columns\n")
+
+# ── Derive y: 9-class mobility × ageing profile ────────────────────────────
+population_col <- "Estimated resident population (no.)"
+median_age_col <- "Median age - persons (years)"
+
+combined <- combined %>%
+  arrange(Code, Year) %>%
+  group_by(Code) %>%
+  mutate(
+    population_change_pct = (.data[[population_col]] - lag(.data[[population_col]])) / lag(.data[[population_col]]) * 100,
+    median_age_yoy = .data[[median_age_col]] - lag(.data[[median_age_col]])
+  ) %>%
+  ungroup() %>%
+  mutate(
+    mobility = case_when(
+      is.na(population_change_pct) ~ NA_character_,
+      population_change_pct > 1 ~ "moving_in",
+      population_change_pct < -1 ~ "moving_out",
+      TRUE ~ "stable"
+    ),
+    ageing_pattern = case_when(
+      is.na(median_age_yoy) ~ NA_character_,
+      median_age_yoy > 0.5 ~ "ageing",
+      median_age_yoy < -0.5 ~ "growing_younger",
+      TRUE ~ "age_stable"
+    ),
+    profile_9 = paste(mobility, ageing_pattern, sep = " x ")
+  )
+ 
+combined_labelled <- combined %>%
+  filter(!is.na(mobility), !is.na(ageing_pattern))
+
+cat("\n9-class profile distribution (", format(nrow(combined_labelled), big.mark = ","), " labelled rows):\n", sep = "")
+print(sort(table(combined_labelled$profile_9), decreasing = TRUE))
+
+# ── Feature-to-outcome bivariate plots ──────────────────────────────────────
+feature_candidates <- c(
+  "Population density (persons/km2)",
+  "Median age - persons (years)",
+  "Working age population (aged 15-64 years) (%)",
+  "$1-$499 per week (%)",
+  "$3000 or more per week (%)"
+)
+
+plot_features <- intersect(feature_candidates, names(combined_labelled))
+
+profile_order <- c(
+  "moving_out x ageing", "moving_out x age_stable", "moving_out x growing_younger",
+  "stable x ageing", "stable x age_stable", "stable x growing_younger",
+  "moving_in x ageing", "moving_in x age_stable", "moving_in x growing_younger"
+)
+
+plot_df <- combined_labelled %>%
+  mutate(profile_9 = factor(profile_9, levels = profile_order)) %>%
+  select(profile_9, all_of(plot_features)) %>%
+  pivot_longer(cols = all_of(plot_features), names_to = "feature", values_to = "value")
+
+ggplot(plot_df, aes(x = profile_9, y = value, fill = profile_9)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(~ feature, scales = "free_y") +
+  labs(
+    title = "Key Features by 9-Class Mobility × Ageing Profile",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1))
+```
+
+The boxplots above show feature distributions by the combined 9-class profile. Features that show clearly separated distributions across these joint labels are strong candidates as predictors in the classification models. We look for variables where classes such as *moving_out x ageing* differ visibly from *moving_in x growing_younger* in terms of income share, population density, working-age proportion, or age structure.
+
+For planning, the matrix is more informative than either dimension alone. For example, *moving_out x ageing* may signal brain drain and a need for local support services, *stable x age_stable* may suggest service maintenance and retention strategies, and *moving_in x growing_younger* may indicate pressure for schools, childcare, housing, and family infrastructure.
+
+
+
+3-3 Data Visualisation
+
+```{r}
+###
+```
